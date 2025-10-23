@@ -1,22 +1,16 @@
-# C:\Workshop-System\backend\app\main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from .database import init_db
-from . import auth
-
-# إن كانت هذه الراوترات موجودة لديك، سيعمل الاستيراد.
-# لو لم تكن موجودة بعد، اتركها كما هي وسنضيفها لاحقًا.
 from .routers import spares, engines, generators, search_export, exporter
 
 app = FastAPI(
-    title="Workshop Management API",
+    title="Workshop Management API (No Auth Mode)",
     version="1.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
 
-# CORS (اسمح من كل المصادر حالياً)
+# السماح بالوصول من أي مصدر
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,21 +21,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
-    # ينشئ جدول users وباقي الجداول المسجّلة في الموديلات
     init_db()
 
 @app.get("/")
-def root():
-    return {"ok": True, "service": "workshop-backend"}
+def home():
+    return {"ok": True, "mode": "no-auth", "msg": "Workshop system running without login"}
 
 @app.get("/api/health")
 def health():
     return {"ok": True}
 
-# تجميع المسارات تحت /api
-app.include_router(auth.router,          prefix="/api")
-app.include_router(spares.router,        prefix="/api")
-app.include_router(engines.router,       prefix="/api")
-app.include_router(generators.router,    prefix="/api")
+# تضمين جميع المسارات الأخرى
+app.include_router(spares.router,       prefix="/api")
+app.include_router(engines.router,      prefix="/api")
+app.include_router(generators.router,   prefix="/api")
 app.include_router(search_export.router, prefix="/api")
-app.include_router(exporter.router,      prefix="/api")
+app.include_router(exporter.router,     prefix="/api")
