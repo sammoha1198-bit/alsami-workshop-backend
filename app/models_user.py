@@ -1,17 +1,11 @@
-# C:\Workshop-System\backend\app\database.py
-import os
-from sqlmodel import SQLModel, Session, create_engine
+# C:\Workshop-System\backend\app\models_user.py
+from typing import Optional
+from sqlmodel import SQLModel, Field
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////tmp/ws.db")
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
-
-def get_session():
-    with Session(engine) as session:
-        yield session
-
-def init_db():
-    # استيراد كل الموديلات هنا فقط لتفادي الاستيراد الدائري
-    from .models_user import User  # مهم: كي تُسجَّل طاولة users
-    # إن أردت إنشاء بقية الجداول لاحقًا، ضع استيراداتها هنا أيضًا.
-    SQLModel.metadata.create_all(engine)
+class User(SQLModel, table=True):
+    __tablename__ = "users"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True)
+    name: str
+    role: str = Field(default="viewer")  # admin | tech | viewer
+    password_hash: str
