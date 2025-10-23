@@ -1,4 +1,6 @@
 from sqlmodel import SQLModel, create_engine, Session
+from .auth import User  # مهم: حتى تُسجَّل طاولة User داخل metadata
+
 import os
 
 DB_URL = os.getenv("DATABASE_URL", "sqlite:///workshop.db")
