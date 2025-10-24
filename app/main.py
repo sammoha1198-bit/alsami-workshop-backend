@@ -1,16 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+# ✅ الاستيراد الصحيح للدالة الموجودة في database.py
 from .database import init_db
-from .routers import spares, engines, generators, search_export, exporter
 
-app = FastAPI(
-    title="Workshop Management API (No Auth Mode)",
-    version="1.0.0",
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
-)
+# الراوترات
+from .routers import engines, generators, search_export, exporter
 
-# السماح بالوصول من أي مصدر
+app = FastAPI(title="Workshop System", version="1.0")
+
+# CORS للواجهة
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,21 +19,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
+# ✅ إنشاء الجداول مرة واحدة
+init_db()
+
+# ✅ ربط الراوترات
+app.include_router(engines.router)
+app.include_router(generators.router)
+app.include_router(search_export.router)
+app.include_router(exporter.router)
+
+# ✅ خدمة الواجهة الثابتة: افتح http://127.0.0.1:2000/static/index.html
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 @app.get("/")
-def home():
-    return {"ok": True, "mode": "no-auth", "msg": "Workshop system running without login"}
-
-@app.get("/api/health")
-def health():
-    return {"ok": True}
-
-# تضمين جميع المسارات الأخرى
-app.include_router(spares.router,       prefix="/api")
-app.include_router(engines.router,      prefix="/api")
-app.include_router(generators.router,   prefix="/api")
-app.include_router(search_export.router, prefix="/api")
-app.include_router(exporter.router,     prefix="/api")
+def root():
+    return {"service": "Workshop API", "status": "running", "static": "/static/index.html"}

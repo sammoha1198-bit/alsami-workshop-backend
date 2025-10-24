@@ -1,349 +1,387 @@
-from typing import Dict, Optional, List
-from datetime import datetime
+# app/routers/exporter.py
+
+from io import BytesIO
+from typing import Optional, Iterable, List, Tuple
+from datetime import datetime, date
+
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from ..auth import role_required  # ← أضِف هذا
 
-import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
 from ..database import get_session
 from ..models import (
-    EngineSupply, EngineIssue, EngineRehab, EngineCheck, EngineUpload, EngineLathe, EnginePump, EngineElectrical,
+    EngineSupply, EngineIssue, EngineRehab, EngineCheck, EngineUpload,
+    EngineLathe, EnginePump, EngineElectrical,
     GenSupply, GenIssue, GenInspect
 )
 
-router = APIRouter(prefix="/export", tags=["export"])
+router = APIRouter(prefix="/api/export", tags=["Export"])
 
-# ...
+# ======================= أدوات مساعدة عامة =======================
 
-def _style_ws(ws, headers):
-    ws.sheet_view.rightToLeft = True
-    fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-    thin = Side(style="thin", color="CCCCCC")
-    ws.append(headers)
-    for c in ws[1]:
-        c.font = Font(bold=True); c.alignment = Alignment(horizontal="center")
-        c.fill = fill; c.border = Border(top=thin, left=thin, right=thin, bottom=thin)
-    for col in ws.columns:
-        ws.column_dimensions[col[0].column_letter].width = 22
-
-def _date_of(rec, *names):
-    for n in names:
-        v = getattr(rec, n, None)
-        if v: return v
-    return None
-
-# --------- Helpers ----------
-def parse_date(s: Optional[str]) -> Optional[datetime]:
+def _parse_date(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
     try:
-        return datetime.fromisoformat(s)
+        return datetime.fromisoformat(s).date()
     except Exception:
-        return None
+        # دعم صيغة yyyy-mm-dd
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return None
 
-def in_range(dt: Optional[datetime], d1: Optional[datetime], d2: Optional[datetime]) -> bool:
-    if not dt:
-        return False
-    if d1 and dt < d1:
-        return False
-    if d2 and dt > d2:
-        return False
-    return True
+def _wb() -> Workbook:
+    wb = Workbook()
+    return wb
 
-def latest(rows: List, date_field: str = "date"):
-    """أعد أحدث سجل (أكبر تاريخ) من قائمة سجلات، وإلا None"""
-    if not rows:
-        return None
-    rows = [r for r in rows if getattr(r, date_field, None)]
-    if not rows:
-        return None
-    return sorted(rows, key=lambda r: getattr(r, date_field))[ -1 ]
-
-def style_header(ws, labels):
+def _ws(wb: Workbook, title: str):
+    ws = wb.create_sheet(title=title[:31])  # حد العنوان في Excel
+    # RTL
     ws.sheet_view.rightToLeft = True
-    fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-    thin = Side(style="thin", color="CCCCCC")
-    ws.append(labels)
-    for c in ws[1]:
-        c.font = Font(bold=True)
-        c.alignment = Alignment(horizontal="center")
-        c.fill = fill
-        c.border = Border(top=thin, left=thin, right=thin, bottom=thin)
-    for col in ws.columns:
-        ws.column_dimensions[col[0].column_letter].width = 18
+    return ws
 
-def yn(v: Optional[bool]) -> str:
-    return "نعم" if v is True else "لا" if v is False else ""
+def _style_header(ws, row: int, cols_count: int):
+    fill = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
+    font = Font(bold=True)
+    align = Alignment(horizontal="center", vertical="center")
+    border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+    for c in range(1, cols_count + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = align
+        cell.border = border
 
-# ========= صرف المحركات =========
-@router.get("/engines/issue")
-def export_engines_issue(date_from: str | None = Query(None, alias="from"),
-                         date_to: str | None = Query(None, alias="to"),
-                         session: Session = Depends(get_session)):
-    d1, d2 = parse_date(date_from), parse_date(date_to)
-    rows = [r for r in session.exec(select(EngineIssue)).all()
-            if in_range(_date_of(r, "date"), d1, d2)]
-    wb = Workbook(); ws = wb.active; ws.title = "صرف المحركات"
-    _style_ws(ws, ["الرقم التسلسلي","الموقع الحالي","المستلم","الجهة الطالبة","تاريخ الصرف","ملاحظات"])
+def _style_table(ws, start_row: int, rows_count: int, cols_count: int):
+    # حدود وخلايا عامة
+    align = Alignment(horizontal="right", vertical="center", wrap_text=True)
+    border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+    for r in range(start_row, start_row + rows_count):
+        for c in range(1, cols_count + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = align
+            cell.border = border
+
+def _autosize(ws, upto_col: int):
+    for c in range(1, upto_col + 1):
+        letter = get_column_letter(c)
+        ws.column_dimensions[letter].width = 18
+
+def _date_fmt(d: Optional[datetime]) -> str:
+    if not d:
+        return ""
+    if isinstance(d, date) and not isinstance(d, datetime):
+        return d.isoformat()
+    return str(d)[:10]
+
+# فلترة بالتاريخ داخل الاستعلام عندما يتوفر عمود تاريخ
+def _range_filter(q, col, d_from: Optional[date], d_to: Optional[date]):
+    if d_from:
+        q = q.where(col >= datetime.combine(d_from, datetime.min.time()))
+    if d_to:
+        q = q.where(col <= datetime.combine(d_to, datetime.max.time()))
+    return q
+
+# ======================= إنشاء شيتات الأنواع =======================
+
+def sheet_engine_supply(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "توريد المحركات")
+    headers = ["الرقم التسلسلي", "نوع المحرك", "المودل", "الموقع السابق", "المورد", "تاريخ التوريد", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineSupply)
+    q = _range_filter(q, EngineSupply.date, d_from, d_to)
+    rows = session.exec(q).all()
     for r in rows:
-        ws.append([r.serial, r.current_site, r.receiver, r.requester, r.date, getattr(r,"notes", "")])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=engines_issue.xlsx"})
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
-# ========= صرف المولدات =========
-@router.get("/generators/issue")
-def export_generators_issue(date_from: str | None = Query(None, alias="from"),
-                            date_to: str | None = Query(None, alias="to"),
-                            session: Session = Depends(get_session)):
-    d1, d2 = parse_date(date_from), parse_date(date_to)
-    rows = [r for r in session.exec(select(GenIssue)).all()
-            if in_range(_date_of(r, "date", "issue_date"), d1, d2)]
-    wb = Workbook(); ws = wb.active; ws.title = "صرف المولدات"
-    _style_ws(ws, ["الترميز","تاريخ الصرف","المستلم","الجهة الطالبة","الموقع الحالي","ملاحظات"])
+        ws.append([
+            r.serial or "", r.engine_type or "", r.model or "", r.prev_site or "",
+            r.supplier or "", _date_fmt(r.date), r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_issue(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "صرف المحركات")
+    headers = ["الرقم التسلسلي", "الموقع الحالي", "المستلم", "الجهة الطالبة", "تاريخ الصرف", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineIssue)
+    q = _range_filter(q, EngineIssue.date, d_from, d_to)
+    rows = session.exec(q).all()
     for r in rows:
-        ws.append([r.code, r.issue_date, r.receiver, r.requester, r.current_site, getattr(r,"notes","")])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=generators_issue.xlsx"})
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
-# ========= المخرطة =========
-@router.get("/engines/lathe")
-def export_engines_lathe(date_from: str | None = Query(None, alias="from"),
-                         date_to: str | None = Query(None, alias="to"),
-                         session: Session = Depends(get_session)):
-    d1, d2 = parse_date(date_from), parse_date(date_to)
-    rows = [r for r in session.exec(select(EngineLathe)).all()
-            if in_range(_date_of(r, "date", "lathe_supply_date"), d1, d2)]
-    wb = Workbook(); ws = wb.active; ws.title = "المخرطة"
-    _style_ws(ws, ["الرقم التسلسلي","تأهيل المخرطة","ملاحظات","تاريخ التوريد للمخرطة"])
+        ws.append([
+            r.serial or "", r.current_site or "", r.receiver or "",
+            r.requester or "", _date_fmt(r.date), r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_rehab(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "تأهيل المحركات")
+    headers = ["الرقم التسلسلي", "المؤهل", "نوع التأهيل", "تاريخ التأهيل", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineRehab)
+    q = _range_filter(q, EngineRehab.date, d_from, d_to)
+    rows = session.exec(q).all()
     for r in rows:
-        ws.append([r.serial, r.lathe_rehab, getattr(r,"notes",""), getattr(r,"lathe_supply_date", "")])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=engines_lathe.xlsx"})
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
-# ========= الصريمي =========
-@router.get("/engines/electrical")
-def export_engines_electrical(date_from: str | None = Query(None, alias="from"),
-                              date_to: str | None = Query(None, alias="to"),
-                              session: Session = Depends(get_session)):
-    d1, d2 = parse_date(date_from), parse_date(date_to)
-    rows = [r for r in session.exec(select(EngineElectrical)).all()
-            if in_range(_date_of(r, "date"), d1, d2)]
-    wb = Workbook(); ws = wb.active; ws.title = "الصريمي"
-    _style_ws(ws, ["الرقم التسلسلي","النوع","سلف","دينمو","تاريخ"])
-    def yn(v): return "نعم" if v else "لا" if v is False else ""
+        ws.append([
+            r.serial or "", r.rehab_by or "", r.rehab_type or "",
+            _date_fmt(r.date), r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_check(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "فحص المحركات")
+    headers = ["الرقم التسلسلي", "الفاحص", "الوصف", "تاريخ الفحص", "ملاحظات الفحص"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineCheck)
+    q = _range_filter(q, EngineCheck.date, d_from, d_to)
+    rows = session.exec(q).all()
     for r in rows:
-        ws.append([r.serial, r.kind, yn(getattr(r,"has_starter",None)), yn(getattr(r,"has_dynamo",None)), getattr(r,"date","")])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=engines_electrical.xlsx"})
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
-# ========= البمبات والنوزلات =========
-@router.get("/engines/pump")
-def export_engines_pump(date_from: str | None = Query(None, alias="from"),
-                        date_to: str | None = Query(None, alias="to"),
-                        session: Session = Depends(get_session)):
-    d1, d2 = parse_date(date_from), parse_date(date_to)
-    rows = [r for r in session.exec(select(EnginePump)).all()
-            if in_range(_date_of(r, "date"), d1, d2)]
-    wb = Workbook(); ws = wb.active; ws.title = "البمبات والنوزلات"
-    _style_ws(ws, ["الرقم التسلسلي للمحرك","الرقم التسلسلي للبمب","تأهيل البمب","ملاحظات","تاريخ"])
+        ws.append([
+            r.serial or "", r.inspector or "", r.description or "",
+            _date_fmt(r.date), getattr(r, "check_notes", None) or getattr(r, "notes", "") or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_upload(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "رفع المحركات")
+    headers = ["الرقم التسلسلي", "ملف المؤهل (نعم/لا)", "ملف الفحص (نعم/لا)", "تاريخ رفع المؤهل", "تاريخ رفع الفحص", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineUpload)
+    # لا يوجد عمود تاريخ واحد؛ نستخدم rehab_date و check_date (فلترة واسعة: أي منهما يقع داخل المدى)
+    all_rows = session.exec(q).all()
+    def in_range(u: EngineUpload) -> bool:
+        def ok(dv: Optional[datetime]) -> bool:
+            if not (d_from or d_to):
+                return True
+            if not dv:
+                return False
+            d = dv.date()
+            if d_from and d < d_from:
+                return False
+            if d_to and d > d_to:
+                return False
+            return True
+        return ok(u.rehab_date) or ok(u.check_date)
+
+    rows = [r for r in all_rows if in_range(r)]
     for r in rows:
-        ws.append([r.serial, r.pump_serial, r.pump_rehab, getattr(r,"notes",""), getattr(r,"date","")])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=engines_pump.xlsx"})
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
-# ===================== محركات — أعمدة مفصلة =====================
-@router.get("/engines")
-def export_engines_columns(
+        ws.append([
+            r.serial or "",
+            (r.rehab_file or ""), (r.check_file or ""),
+            _date_fmt(r.rehab_date), _date_fmt(r.check_date),
+            r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_lathe(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "المخرطة (محركات)")
+    headers = ["الرقم التسلسلي", "تأهيل المخرطة", "تاريخ توريد للمخرطة", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineLathe)
+    q = _range_filter(q, EngineLathe.lathe_supply_date, d_from, d_to)
+    rows = session.exec(q).all()
+    for r in rows:
+        ws.append([
+            r.serial or "", r.lathe_rehab or "", _date_fmt(r.lathe_supply_date), r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_pump(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "البمبات والنوزلات")
+    headers = ["الرقم التسلسلي للمحرك", "الرقم التسلسلي للبمب", "تأهيل البمب", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    # لا يوجد تاريخ في النموذج => نتجاهل الفلترة الزمنية
+    rows = session.exec(select(EnginePump)).all()
+    for r in rows:
+        ws.append([
+            r.serial or "", r.pump_serial or "", r.pump_rehab or "", r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_engine_electrical(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "الصريمي (كهرباء)")
+    headers = ["الرقم التسلسلي", "النوع", "سلف", "دينمو", "تاريخ"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(EngineElectrical)
+    q = _range_filter(q, EngineElectrical.date, d_from, d_to)
+    rows = session.exec(q).all()
+    for r in rows:
+        ws.append([
+            r.serial or "", r.kind or "",
+            "نعم" if r.has_starter else "لا",
+            "نعم" if r.has_dynamo else "لا",
+            _date_fmt(r.date)
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_gen_supply(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "توريد المولدات")
+    headers = ["الترميز", "نوع المولد", "المودل", "الموقع السابق", "اسم المورد", "الجهة الموردة", "تاريخ التوريد", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(GenSupply)
+    q = _range_filter(q, GenSupply.date, d_from, d_to)
+    rows = session.exec(q).all()
+    for r in rows:
+        ws.append([
+            r.code or "", r.gen_type or "", r.model or "", r.prev_site or "",
+            r.supplier_name or "", r.supplier_entity or "", _date_fmt(r.date), r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_gen_issue(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "صرف المولدات")
+    headers = ["الترميز", "تاريخ الصرف", "المستلم", "الجهة الطالبة", "الموقع الحالي", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(GenIssue)
+    q = _range_filter(q, GenIssue.issue_date, d_from, d_to)
+    rows = session.exec(q).all()
+    for r in rows:
+        ws.append([
+            r.code or "", _date_fmt(r.issue_date), r.receiver or "", r.requester or "",
+            r.current_site or "", r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+def sheet_gen_inspect(session: Session, wb: Workbook, d_from: Optional[date], d_to: Optional[date]):
+    ws = _ws(wb, "الرفع والفحص (مولدات)")
+    headers = ["الترميز", "الفاحص", "المؤهل الكهربائي", "تاريخ التأهيل", "ملاحظات"]
+    ws.append(headers)
+    _style_header(ws, 1, len(headers))
+
+    q = select(GenInspect)
+    q = _range_filter(q, GenInspect.rehab_date, d_from, d_to)
+    rows = session.exec(q).all()
+    for r in rows:
+        ws.append([
+            r.code or "", r.inspector or "", r.electrical_rehab_by or "",
+            _date_fmt(r.rehab_date), r.notes or ""
+        ])
+    _style_table(ws, 2, len(rows), len(headers))
+    _autosize(ws, len(headers))
+
+# ======================= الراوت الرئيسي للتصدير =======================
+
+@router.get("/{kind}")
+def export_kind(
+    kind: str,
     date_from: Optional[str] = Query(None, alias="from"),
     date_to: Optional[str]   = Query(None, alias="to"),
-    session: Session = Depends(get_session),
-    user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
+    session: Session = Depends(get_session)
 ):
+    """
+    kinds:
+      - engines, generators
+      - engines/issue, generators/issue
+      - engines/rehab, engines/check, engines/upload
+      - engines/lathe, engines/electrical, engines/pump
+      - generators/inspect
+      - all  -> ملف واحد يحتوي شيتات منفصلة لجميع ما سبق
+    """
+    d_from = _parse_date(date_from)
+    d_to   = _parse_date(date_to)
 
-    d1, d2 = parse_date(date_from), parse_date(date_to)
+    wb = _wb()
+    # احذف الشيت الافتراضي الذي ينشئه openpyxl
+    if wb.active and wb.active.max_row == 1 and wb.active.max_column == 1 and wb.active["A1"].value is None:
+        wb.remove(wb.active)
 
-    # اجمع حسب serial
-    groups: Dict[str, Dict[str, List]] = {}
-    def put(key: str, row):
-        if not in_range(getattr(row, "date", None), d1, d2):
-            return
-        g = groups.setdefault(row.serial, {"supply":[], "issue":[], "rehab":[], "check":[], "upload":[], "lathe":[], "pump":[], "electrical":[]})
-        g[key].append(row)
+    def add_one(_kind: str):
+        if _kind == "engines":
+            sheet_engine_supply(session, wb, d_from, d_to)
+        elif _kind == "engines/issue":
+            sheet_engine_issue(session, wb, d_from, d_to)
+        elif _kind == "engines/rehab":
+            sheet_engine_rehab(session, wb, d_from, d_to)
+        elif _kind == "engines/check":
+            sheet_engine_check(session, wb, d_from, d_to)
+        elif _kind == "engines/upload":
+            sheet_engine_upload(session, wb, d_from, d_to)
+        elif _kind == "engines/lathe":
+            sheet_engine_lathe(session, wb, d_from, d_to)
+        elif _kind == "engines/electrical":
+            sheet_engine_electrical(session, wb, d_from, d_to)
+        elif _kind == "engines/pump":
+            sheet_engine_pump(session, wb, d_from, d_to)
+        elif _kind == "generators":
+            sheet_gen_supply(session, wb, d_from, d_to)
+        elif _kind == "generators/issue":
+            sheet_gen_issue(session, wb, d_from, d_to)
+        elif _kind == "generators/inspect":
+            sheet_gen_inspect(session, wb, d_from, d_to)
+        else:
+            # نوع غير معروف؛ نتجاهله بصمت
+            pass
 
-    for r in session.exec(select(EngineSupply)).all():    put("supply", r)
-    for r in session.exec(select(EngineIssue)).all():     put("issue", r)
-    for r in session.exec(select(EngineRehab)).all():     put("rehab", r)
-    for r in session.exec(select(EngineCheck)).all():     put("check", r)
-    for r in session.exec(select(EngineUpload)).all():    put("upload", r)
-    for r in session.exec(select(EngineLathe)).all():     put("lathe", r)
-    for r in session.exec(select(EnginePump)).all():      put("pump", r)
-    for r in session.exec(select(EngineElectrical)).all():put("electrical", r)
+    if kind == "all":
+        kinds = [
+            "engines", "engines/issue", "engines/rehab", "engines/check", "engines/upload",
+            "engines/lathe", "engines/electrical", "engines/pump",
+            "generators", "generators/issue", "generators/inspect"
+        ]
+        for k in kinds:
+            add_one(k)
+        filename = "تقرير-الورشة-شامل.xlsx"
+    else:
+        add_one(kind)
+        safe = kind.replace("/", "-")
+        filename = f"تقرير-{safe}.xlsx"
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "المحركات (أعمدة)"
-    style_header(ws, [
-        # أساسي
-        "الرقم التسلسلي",
-        # توريد
-        "توريد/نوع", "توريد/مودل", "توريد/مورد", "توريد/الموقع السابق", "توريد/تاريخ",
-        # صرف
-        "صرف/الموقع الحالي", "صرف/المستلم", "صرف/الجهة الطالبة", "صرف/تاريخ",
-        # تأهيل
-        "تأهيل/المؤهل", "تأهيل/نوع التأهيل", "تأهيل/ملاحظات", "تأهيل/تاريخ",
-        # فحص
-        "فحص/الفاحص", "فحص/الوصف", "فحص/ملاحظات", "فحص/تاريخ",
-        # رفع
-        "رفع/ملف المؤهل", "رفع/ملف الفحص", "رفع/تاريخ المؤهل", "رفع/تاريخ الفحص", "رفع/ملاحظات",
-        # مخرطة
-        "مخرطة/تأهيل", "مخرطة/ملاحظات", "مخرطة/تاريخ توريد للمخرطة",
-        # بمبات
-        "بمبات/رقم بمب", "بمبات/تأهيل", "بمبات/ملاحظات",
-        # صريمي
-        "صريمي/النوع", "صريمي/سلف", "صريمي/دينمو",
-    ])
+    # إذا لم تُنشأ أي شيت (نوع خاطئ مثلاً) أضف شيتًا فارغًا لتجنب خطأ الحفظ
+    if not wb.worksheets:
+        ws = _ws(wb, "فارغ")
+        ws.append(["لا توجد بيانات"])
 
-    for serial, g in groups.items():
-        s  = latest(g["supply"])
-        isr = latest(g["issue"])
-        rh = latest(g["rehab"])
-        ch = latest(g["check"])
-        up = latest(g["upload"])
-        lt = latest(g["lathe"])
-        pm = latest(g["pump"])
-        el = latest(g["electrical"])
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
 
-        ws.append([
-            serial,
-            # توريد
-            getattr(s, "engine_type", None) or "",
-            getattr(s, "model", None) or "",
-            getattr(s, "supplier", None) or "",
-            getattr(s, "prev_site", None) or "",
-            getattr(s, "date", None) or "",
-            # صرف
-            getattr(isr, "current_site", None) or "",
-            getattr(isr, "receiver", None) or "",
-            getattr(isr, "requester", None) or "",
-            getattr(isr, "date", None) or "",
-            # تأهيل
-            getattr(rh, "rehab_by", None) or "",
-            getattr(rh, "rehab_type", None) or "",
-            getattr(rh, "notes", None) or "",
-            getattr(rh, "date", None) or "",
-            # فحص
-            getattr(ch, "inspector", None) or "",
-            getattr(ch, "description", None) or "",
-            getattr(ch, "check_notes", None) or "",
-            getattr(ch, "date", None) or "",
-            # رفع
-            getattr(up, "rehab_file", None) or "",
-            getattr(up, "check_file", None) or "",
-            getattr(up, "rehab_date", None) or "",
-            getattr(up, "check_date", None) or "",
-            getattr(up, "notes", None) or "",
-            # مخرطة
-            getattr(lt, "lathe_rehab", None) or "",
-            getattr(lt, "notes", None) or "",
-            getattr(lt, "lathe_supply_date", None) or "",
-            # بمبات
-            getattr(pm, "pump_serial", None) or "",
-            getattr(pm, "pump_rehab", None) or "",
-            getattr(pm, "notes", None) or "",
-            # صريمي
-            getattr(el, "kind", None) or "",
-            yn(getattr(el, "has_starter", None)),
-            yn(getattr(el, "has_dynamo", None)),
-        ])
+    # ترميز الاسم RFC5987 لتجنب UnicodeEncodeError
+    from urllib.parse import quote
+    encoded_filename = quote(filename.encode("utf-8"))
 
-    out = io.BytesIO()
-    wb.save(out); out.seek(0)
-    filename = f"engines_columns_{date_from or 'all'}_{date_to or 'all'}.xlsx"
-    return StreamingResponse(out,
+    return StreamingResponse(
+        bio,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+        }
     )
-
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin
-# ===================== مولدات — أعمدة مفصلة =====================
-@router.get("/generators")
-def export_generators_columns(
-    date_from: Optional[str] = Query(None, alias="from"),
-    date_to: Optional[str]   = Query(None, alias="to"),
-    session: Session = Depends(get_session),
-):
-    d1, d2 = parse_date(date_from), parse_date(date_to)
-
-    groups: Dict[str, Dict[str, List]] = {}
-    def put(key: str, row):
-        if not in_range(getattr(row, "date", None), d1, d2):
-            return
-        g = groups.setdefault(row.code, {"supply":[], "issue":[], "inspect":[]})
-        g[key].append(row)
-
-    for r in session.exec(select(GenSupply)).all():  put("supply", r)
-    for r in session.exec(select(GenIssue)).all():   put("issue", r)
-    for r in session.exec(select(GenInspect)).all(): put("inspect", r)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "المولدات (أعمدة)"
-    style_header(ws, [
-        "الترميز",
-        # توريد
-        "توريد/نوع", "توريد/مودل", "توريد/المورد", "توريد/الجهة الموردة", "توريد/الموقع السابق", "توريد/تاريخ",
-        # صرف
-        "صرف/تاريخ", "صرف/المستلم", "صرف/الجهة الطالبة", "صرف/الموقع الحالي", "صرف/ملاحظات",
-        # الرفع والفحص
-        "فحص/الفاحص", "فحص/المؤهل الكهربائي", "فحص/تاريخ التأهيل", "فحص/ملاحظات",
-    ])
-
-    for code, g in groups.items():
-        s  = latest(g["supply"])
-        isr = latest(g["issue"], date_field="date")  # (يوجد حقل issue_date أيضًا)
-        ins = latest(g["inspect"])
-
-        ws.append([
-            code,
-            # توريد
-            getattr(s, "gen_type", None) or "",
-            getattr(s, "model", None) or "",
-            getattr(s, "supplier_name", None) or "",
-            getattr(s, "supplier_entity", None) or "",
-            getattr(s, "prev_site", None) or "",
-            getattr(s, "date", None) or "",
-            # صرف
-            getattr(isr, "issue_date", None) or "",
-            getattr(isr, "receiver", None) or "",
-            getattr(isr, "requester", None) or "",
-            getattr(isr, "current_site", None) or "",
-            getattr(isr, "notes", None) or "",
-            # فحص
-            getattr(ins, "inspector", None) or "",
-            getattr(ins, "electrical_rehab_by", None) or "",
-            getattr(ins, "rehab_date", None) or "",
-            getattr(ins, "notes", None) or "",
-        ])
-
-    out = io.BytesIO()
-    wb.save(out); out.seek(0)
-    filename = f"generators_columns_{date_from or 'all'}_{date_to or 'all'}.xlsx"
-    return StreamingResponse(out,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
-user=Depends(role_required(["admin"]))  # ← يمنع غير الـadmin

@@ -1,19 +1,11 @@
-import os
-from sqlmodel import SQLModel, Session, create_engine
+from sqlmodel import SQLModel, create_engine, Session
 
-# استخدم DATABASE_URL من البيئة، وإلا SQLite مؤقت على Render
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////tmp/ws.db")
+DATABASE_URL = "sqlite:///workshop.db"
+engine = create_engine(DATABASE_URL, echo=False)
 
-# إعدادات خاصة لـ SQLite
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-# إنشاء المحرك مرة واحدة للتطبيق كله
-engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
+def init_db():
+    SQLModel.metadata.create_all(engine)
 
 def get_session():
-    """Dependency للـ FastAPI يعيد Session موحّدة."""
     with Session(engine) as session:
         yield session
-def init_db():
-    from .models_user import User  # ← مهم: منع الاستيراد الدائري
-    SQLModel.metadata.create_all(engine)
