@@ -424,6 +424,18 @@ def export_xlsx(payload: Dict[str, Any] = Body(...)):
 # =========================================================
 # للتشغيل المحلي
 # =========================================================
+# =======================================================
+#  مسار مؤقت لإدخال بيانات تجريبية (بدون shell)
+# =======================================================
+@app.get("/api/seed")
+def seed_demo_data(session: Session = Depends(get_session)):
+    from app.seed_demo_data import main as seed_main
+    try:
+        seed_main()
+        return {"ok": True, "message": "✅ تم إدخال البيانات بنجاح إلى قاعدة البيانات."}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
 
