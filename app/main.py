@@ -1,204 +1,178 @@
 # app/main.py
-from fastapi import FastAPI, Body, Depends
+from __future__ import annotations
+
+import datetime
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote
+
+from fastapi import Body, Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from typing import Dict, Any, List, Union
-from io import BytesIO
-from urllib.parse import quote
-import datetime
-import os
+from sqlmodel import Session, select, SQLModel
+from sqlalchemy import Column, Text  # noqa: F401  (مطلوب لتصريح sa_column في models)
+from sqlalchemy import text as sqla_text
 
-from sqlmodel import Session, select
-
-from sqlmodel import SQLModel
-from .database import engine
-app = FastAPI(title="Alsami Workshop Backend", version="4.0")
-# Endpoint إداري مؤقت (احذفه بعد الانتهاء)
-
-
-from .database import init_db, get_session, DB_PATH
+from .database import init_db, get_session, engine
 from . import models
+
+# محاولـة استيراد سكريبت البذور (اختياري)
 try:
-    from .seed_demo_data import seed
-except ImportError:
-    seed = None
-  # نزرع بيانات إذا مافيش
+    from .seed_demo_data import main as seed_main  # type: ignore
+except Exception:  # pragma: no cover
+    seed_main = None
 
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+# =====================================================================
+# تهيئة التطبيق و CORS
+# =====================================================================
 
+app = FastAPI(title="Alsami Workshop Backend", version="3.3")
 
-
-# ========== CORS ==========
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # افتحها للـ frontend
+    allow_origins=["*"],         # افتحها حالياً
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =====================================================================
+# أدوات مساعدة عامة
+# =====================================================================
 
-# ========== STARTUP ==========
+def obj2dict(o: Any) -> Dict[str, Any]:
+    """يدعم SQLModel .model_dump() أو .dict()."""
+    if hasattr(o, "model_dump"):
+        return o.model_dump()  # type: ignore[attr-defined]
+    if hasattr(o, "dict"):
+        return o.dict()        # type: ignore[attr-defined]
+    return dict(o)
+
+
+# ----------------- إصلاح المخطط (SQLite) -----------------
+
+def _table_columns(table_name: str) -> set[str]:
+    with engine.connect() as conn:
+        rows = conn.exec_driver_sql(f"PRAGMA table_info({table_name});").fetchall()
+        # ترتيب قيم PRAGMA: (cid, name, type, notnull, dflt_value, pk)
+        return {r[1] for r in rows}
+
+def add_column_if_missing(table: str, column: str, coltype: str):
+    with engine.connect() as conn:
+        cols = _table_columns(table)
+        if column not in cols:
+            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {coltype};")
+
+def repair_sqlite():
+    """
+    يصلّح أعمدة ناقصة في الجداول المعروفة.
+    حالياً: يضمن وجود enginecheck.desc TEXT.
+    """
+    init_db()  # تأكد أن الجداول الأساسية منشأة
+    # أهم حالة ظهرت:
+    add_column_if_missing("enginecheck", "desc", "TEXT")
+
+# =====================================================================
+# تشغيل وقت الإقلاع
+# =====================================================================
+
 @app.on_event("startup")
 def on_startup():
-    init_db()                # ينشئ الجداول إن لم توجد
-    ensure_sqlite_columns()  # يضيف 'desc' إن كان مفقودًا
+    init_db()
+    repair_sqlite()
 
+# =====================================================================
+# المسارات الأساسية
+# =====================================================================
 
-def ensure_sqlite_columns():
-    """
-    ترقية خفيفة للسكيو لايت: لو عمود 'desc' ناقص في enginecheck نضيفه.
-    """
-    with engine.connect() as conn:
-        rows = conn.exec_driver_sql("PRAGMA table_info(enginecheck);").fetchall()
-        cols = {r[1] for r in rows}  # اسم العمود في الفهرس 1
-        if "desc" not in cols:
-            conn.exec_driver_sql("ALTER TABLE enginecheck ADD COLUMN desc TEXT;")
-
-@app.post("/api/admin/rebuild")
-def admin_rebuild():
-    SQLModel.metadata.drop_all(engine)
-    SQLModel.metadata.create_all(engine)
-    return {"ok": True, "msg": "Rebuilt DB schema."}
-# ========== HEALTH ==========
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "time": datetime.datetime.utcnow().isoformat(),
-        "db_exists": DB_PATH.exists(),
-        "db_path": str(DB_PATH),
-    }
+    return {"ok": True, "time": datetime.datetime.utcnow().isoformat()}
 
+# ----------------- البحث -----------------
 
-# =======================================================
-# 1) البحث
-# =======================================================
 @app.get("/api/search/{key}")
 def search_item(key: str, session: Session = Depends(get_session)) -> Dict[str, Any]:
-    """
-    يرجّع كل البيانات المرتبطة بالرقم التسلسلي (محرك)
-    أو بالترميز (مولد)
-    """
-    try:
-        # هيكل فاضي
-        result: Dict[str, Any] = {
-            "engines": {
-                "supply": [],
-                "issue": [],
-                "rehab": [],
-                "check": [],
-                "upload": [],
-                "lathe": [],
-                "pump": [],
-                "electrical": [],
-            },
-            "generators": {
-                "supply": [],
-                "issue": [],
-                "inspect": [],
-            },
-        }
+    result: Dict[str, Any] = {
+        "engines": {
+            "supply": [], "issue": [], "rehab": [], "check": [],
+            "upload": [], "lathe": [], "pump": [], "electrical": [],
+        },
+        "generators": {
+            "supply": [], "issue": [], "inspect": [],
+        },
+    }
 
-        # --- محركات (serial) ---
-        eng_sup = session.exec(
-            select(models.EngineSupply).where(models.EngineSupply.serial == key)
-        ).all()
-        result["engines"]["supply"] = [r.model_dump() for r in eng_sup]
+    # محركات
+    result["engines"]["supply"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineSupply).where(models.EngineSupply.serial == key)
+    ).all()]
 
-        eng_issue = session.exec(
-            select(models.EngineIssue).where(models.EngineIssue.serial == key)
-        ).all()
-        result["engines"]["issue"] = [r.model_dump() for r in eng_issue]
+    result["engines"]["issue"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineIssue).where(models.EngineIssue.serial == key)
+    ).all()]
 
-        eng_rehab = session.exec(
-            select(models.EngineRehab).where(models.EngineRehab.serial == key)
-        ).all()
-        result["engines"]["rehab"] = [r.model_dump() for r in eng_rehab]
+    result["engines"]["rehab"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineRehab).where(models.EngineRehab.serial == key)
+    ).all()]
 
-        eng_check = session.exec(
-            select(models.EngineCheck).where(models.EngineCheck.serial == key)
-        ).all()
-        result["engines"]["check"] = [r.model_dump() for r in eng_check]
+    result["engines"]["check"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineCheck).where(models.EngineCheck.serial == key)
+    ).all()]
 
-        eng_upload = session.exec(
-            select(models.EngineUpload).where(models.EngineUpload.serial == key)
-        ).all()
-        result["engines"]["upload"] = [r.model_dump() for r in eng_upload]
+    result["engines"]["upload"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineUpload).where(models.EngineUpload.serial == key)
+    ).all()]
 
-        eng_lathe = session.exec(
-            select(models.EngineLathe).where(models.EngineLathe.serial == key)
-        ).all()
-        result["engines"]["lathe"] = [r.model_dump() for r in eng_lathe]
+    result["engines"]["lathe"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineLathe).where(models.EngineLathe.serial == key)
+    ).all()]
 
-        eng_pump = session.exec(
-            select(models.EnginePump).where(models.EnginePump.serial == key)
-        ).all()
-        result["engines"]["pump"] = [r.model_dump() for r in eng_pump]
+    result["engines"]["pump"] = [obj2dict(r) for r in session.exec(
+        select(models.EnginePump).where(models.EnginePump.serial == key)
+    ).all()]
 
-        eng_elec = session.exec(
-            select(models.EngineElectrical).where(models.EngineElectrical.serial == key)
-        ).all()
-        result["engines"]["electrical"] = [r.model_dump() for r in eng_elec]
+    result["engines"]["electrical"] = [obj2dict(r) for r in session.exec(
+        select(models.EngineElectrical).where(models.EngineElectrical.serial == key)
+    ).all()]
 
-        # --- مولدات (code) ---
-        gen_sup = session.exec(
-            select(models.GeneratorSupply).where(models.GeneratorSupply.code == key)
-        ).all()
-        result["generators"]["supply"] = [r.model_dump() for r in gen_sup]
+    # مولدات (المفتاح هو code)
+    result["generators"]["supply"] = [obj2dict(r) for r in session.exec(
+        select(models.GeneratorSupply).where(models.GeneratorSupply.code == key)
+    ).all()]
 
-        gen_issue = session.exec(
-            select(models.GeneratorIssue).where(models.GeneratorIssue.code == key)
-        ).all()
-        result["generators"]["issue"] = [r.model_dump() for r in gen_issue]
+    result["generators"]["issue"] = [obj2dict(r) for r in session.exec(
+        select(models.GeneratorIssue).where(models.GeneratorIssue.code == key)
+    ).all()]
 
-        gen_inspect = session.exec(
-            select(models.GeneratorInspect).where(models.GeneratorInspect.code == key)
-        ).all()
-        result["generators"]["inspect"] = [r.model_dump() for r in gen_inspect]
+    result["generators"]["inspect"] = [obj2dict(r) for r in session.exec(
+        select(models.GeneratorInspect).where(models.GeneratorInspect.code == key)
+    ).all()]
 
-        return result
-    except Exception as e:
-        # هنا اللي كان يعطيك 500 على Render
-        print("❌ search error:", e)
-        return JSONResponse(
-            status_code=500,
-            content={"error": "search_failed", "detail": str(e)},
-        )
+    return result
 
 
-# =======================================================
-# 1-b) Endpoints للتشخيص
-# =======================================================
-@app.get("/api/debug/engines")
-def debug_engines(session: Session = Depends(get_session)):
-    rows = session.exec(select(models.EngineSupply).order_by(models.EngineSupply.id)).all()
-    return {"count": len(rows), "items": [r.model_dump() for r in rows]}
+# ----------------- مزامنة دفعات IndexedDB -----------------
 
-@app.get("/api/debug/generators")
-def debug_generators(session: Session = Depends(get_session)):
-    rows = session.exec(select(models.GeneratorSupply).order_by(models.GeneratorSupply.id)).all()
-    return {"count": len(rows), "items": [r.model_dump() for r in rows]}
-
-
-# =======================================================
-# 2) مزامنة الدُفعات من الفرونت
-# =======================================================
 @app.post("/api/sync/batch")
 async def sync_batch(
     payload: Dict[str, Any] = Body(...),
     session: Session = Depends(get_session),
 ) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = payload.get("items", [])
+    items: List[Dict[str, Any]] = payload.get("items", []) or []
     saved = 0
 
     for item in items:
         store = item.get("store")
-        data = item.get("payload", {})
+        data: Dict[str, Any] = item.get("payload", {}) or {}
+
+        def add(obj):
+            nonlocal saved
+            session.add(obj)
+            saved += 1
 
         if store == "eng_supply":
-            obj = models.EngineSupply(
+            add(models.EngineSupply(
                 serial=data.get("serial", ""),
                 engineType=data.get("engineType"),
                 model=data.get("model"),
@@ -206,83 +180,76 @@ async def sync_batch(
                 supDate=data.get("supDate"),
                 supplier=data.get("supplier"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_issue":
-            obj = models.EngineIssue(
+            add(models.EngineIssue(
                 serial=data.get("serial", ""),
                 currSite=data.get("currSite"),
                 receiver=data.get("receiver"),
                 requester=data.get("requester"),
                 issueDate=data.get("issueDate"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_rehab":
-            obj = models.EngineRehab(
+            add(models.EngineRehab(
                 serial=data.get("serial", ""),
                 rehabber=data.get("rehabber"),
                 rehabType=data.get("rehabType"),
                 rehabDate=data.get("rehabDate"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_check":
-            obj = models.EngineCheck(
+            # لاحظ: العمود في DB اسمه "desc" لكن الموديل يعرّف الحقل كـ description
+            add(models.EngineCheck(
                 serial=data.get("serial", ""),
                 inspector=data.get("inspector"),
-                desc=data.get("desc"),
+                description=data.get("description") or data.get("desc"),
                 checkDate=data.get("checkDate"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_upload":
-            obj = models.EngineUpload(
+            add(models.EngineUpload(
                 serial=data.get("serial", ""),
                 rehabUp=data.get("rehabUp"),
                 checkUp=data.get("checkUp"),
                 rehabUpDate=data.get("rehabUpDate"),
                 checkUpDate=data.get("checkUpDate"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_lathe":
-            obj = models.EngineLathe(
+            add(models.EngineLathe(
                 serial=data.get("serial", ""),
                 lathe=data.get("lathe"),
                 latheDate=data.get("latheDate"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_pump":
-            obj = models.EnginePump(
+            add(models.EnginePump(
                 serial=data.get("serial", ""),
                 pumpSerial=data.get("pumpSerial"),
                 pumpRehab=data.get("pumpRehab"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "eng_electrical":
-            obj = models.EngineElectrical(
+            add(models.EngineElectrical(
                 serial=data.get("serial", ""),
                 etype=data.get("etype"),
                 starter=data.get("starter"),
                 alternator=data.get("alternator"),
                 edate=data.get("edate"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         # -------- مولدات --------
         elif store == "gen_supply":
-            obj = models.GeneratorSupply(
+            add(models.GeneratorSupply(
                 code=data.get("code", ""),
                 gType=data.get("gType"),
                 model=data.get("model"),
@@ -291,22 +258,20 @@ async def sync_batch(
                 supplier=data.get("supplier"),
                 vendor=data.get("vendor"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "gen_issue":
-            obj = models.GeneratorIssue(
+            add(models.GeneratorIssue(
                 code=data.get("code", ""),
                 issueDate=data.get("issueDate"),
                 receiver=data.get("receiver"),
                 requester=data.get("requester"),
                 currSite=data.get("currSite"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
         elif store == "gen_inspect":
-            obj = models.GeneratorInspect(
+            add(models.GeneratorInspect(
                 code=data.get("code", ""),
                 inspector=data.get("inspector"),
                 elecRehab=data.get("elecRehab"),
@@ -314,46 +279,38 @@ async def sync_batch(
                 rehabUp=data.get("rehabUp"),
                 checkUp=data.get("checkUp"),
                 notes=data.get("notes"),
-            )
-            session.add(obj); saved += 1
+            ))
 
     session.commit()
     return {"ok": True, "saved": saved}
 
 
-# =======================================================
-# 3) آخر 3
-# =======================================================
+# ----------------- آخر 3 عناصر -----------------
+
 @app.get("/api/last3/engines")
 def last3_engines(session: Session = Depends(get_session)) -> Dict[str, Any]:
     rows = session.exec(
         select(models.EngineSupply).order_by(models.EngineSupply.id.desc()).limit(3)
     ).all()
-    return {
-        "items": [
-            {"serial": r.serial, "prevSite": r.prevSite or ""} for r in rows
-        ]
-    }
+    return {"items": [{"serial": r.serial, "prevSite": r.prevSite or ""} for r in rows]}
 
 @app.get("/api/last3/generators")
 def last3_generators(session: Session = Depends(get_session)) -> Dict[str, Any]:
     rows = session.exec(
         select(models.GeneratorSupply).order_by(models.GeneratorSupply.id.desc()).limit(3)
     ).all()
-    return {
-        "items": [
-            {"code": r.code, "prevSite": r.prevSite or ""} for r in rows
-        ]
-    }
+    return {"items": [{"code": r.code, "prevSite": r.prevSite or ""} for r in rows]}
 
 
-# =======================================================
-# 4) التصدير
-# =======================================================
+# ----------------- تصدير Excel -----------------
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
 @app.post("/api/export/xlsx")
 async def export_xlsx(payload: Dict[str, Any] = Body(...)):
-    original_filename: str = payload.get("filename") or "report.xlsx"
-    safe_filename = "report.xlsx"
+    original_filename: str = payload.get("filename") or "تقرير.xlsx"
+    safe_ascii_name = "report.xlsx"  # اسم ASCII احتياطي للرؤوس
     sheet_name: str = payload.get("sheet") or "تقرير"
     headers: List[str] = payload.get("headers") or []
     raw_rows: List[Union[Dict[str, Any], List[Any]]] = payload.get("rows") or []
@@ -364,8 +321,8 @@ async def export_xlsx(payload: Dict[str, Any] = Body(...)):
     ws.sheet_view.rightToLeft = True
 
     header_fill = PatternFill("solid", fgColor="10b981")
-    alt_fill = PatternFill("solid", fgColor="ecfdf3")
-    white_fill = PatternFill("solid", fgColor="FFFFFF")
+    alt_fill    = PatternFill("solid", fgColor="ecfdf3")
+    white_fill  = PatternFill("solid", fgColor="FFFFFF")
     header_font = Font(bold=True, color="FFFFFF", name="Arial")
     normal_font = Font(name="Arial")
     align_right = Alignment(horizontal="right", vertical="center", wrap_text=True)
@@ -379,20 +336,17 @@ async def export_xlsx(payload: Dict[str, Any] = Body(...)):
     if headers:
         ws.append(headers)
         for col_idx, _ in enumerate(headers, start=1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = align_right
-            cell.border = thin_border
-            ws.column_dimensions[cell.column_letter].width = 28
+            c = ws.cell(row=1, column=col_idx)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = align_right
+            c.border = thin_border
+            ws.column_dimensions[c.column_letter].width = 28
 
     current_row = 2
     for row in raw_rows:
         if isinstance(row, dict):
-            if headers:
-                ordered = [row.get(h, "") for h in headers]
-            else:
-                ordered = list(row.values())
+            ordered = [row.get(h, "") for h in headers] if headers else list(row.values())
         elif isinstance(row, (list, tuple)):
             ordered = list(row)
         else:
@@ -400,11 +354,11 @@ async def export_xlsx(payload: Dict[str, Any] = Body(...)):
 
         ws.append(ordered)
         for col_idx in range(1, len(ordered) + 1):
-            cell = ws.cell(row=current_row, column=col_idx)
-            cell.font = normal_font
-            cell.alignment = align_right
-            cell.border = thin_border
-            cell.fill = alt_fill if current_row % 2 else white_fill
+            c = ws.cell(row=current_row, column=col_idx)
+            c.font = normal_font
+            c.alignment = align_right
+            c.border = thin_border
+            c.fill = alt_fill if current_row % 2 else white_fill
         current_row += 1
 
     ws.append([])
@@ -417,10 +371,12 @@ async def export_xlsx(payload: Dict[str, Any] = Body(...)):
     wb.save(buf)
     buf.seek(0)
 
+    # Content-Disposition يدعم اسم ملف عربي عبر filename*
     encoded_name = quote(original_filename)
     headers_resp = {
         "Content-Disposition": (
-            f"attachment; filename={safe_filename}; filename*=UTF-8''{encoded_name}"
+            f"attachment; filename={safe_ascii_name}; "
+            f"filename*=UTF-8''{encoded_name}"
         )
     }
 
@@ -430,8 +386,33 @@ async def export_xlsx(payload: Dict[str, Any] = Body(...)):
         headers=headers_resp,
     )
 
+# ----------------- البذور (اختياري) -----------------
 
-# للتشغيل المحلي
+@app.get("/api/seed")
+def seed_endpoint():
+    if seed_main is None:
+        return {"ok": False, "error": "seed_demo_data.py غير متوفر"}
+    try:
+        # دالة main في ملف البذور تُنادي init_db بنفسها عادةً
+        seed_main()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ----------------- إصلاح يدوي للمخطط -----------------
+
+@app.post("/api/admin/repair", tags=["admin"])
+def admin_repair():
+    try:
+        repair_sqlite()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# =====================================================================
+# نقطة تشغيل محلية
+# =====================================================================
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=9000, reload=True)
