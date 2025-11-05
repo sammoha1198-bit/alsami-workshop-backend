@@ -4,18 +4,19 @@ from .database import engine, init_db
 from . import models
 
 
-def seed() -> None:
-    """زرع بيانات تجريبية لو قاعدة البيانات فاضية."""
+def run_seed() -> dict:
+    """
+    يضيف بيانات تجريبية فقط لو مافيش بيانات.
+    ينفع نستدعيه من /api/seed في main.py
+    """
     init_db()
 
     with Session(engine) as s:
-        exists = s.exec(select(models.EngineSupply)).first()
-        if exists:
-            # في بيانات، ما نضيف
-            print("⚠️ يوجد بيانات مسبقة، لم أضف بيانات جديدة.")
-            return
+        # لو في بيانات توريد محركات خلاص ما نعيد
+        if s.exec(select(models.EngineSupply)).first():
+            return {"ok": False, "error": "already-seeded"}
 
-        # ------------------- المحركات -------------------
+        # ================== محركات ==================
         engines_supply = [
             models.EngineSupply(
                 serial="111",
@@ -45,8 +46,9 @@ def seed() -> None:
                 notes="محرك تم إعادة تأهيله",
             ),
         ]
+        s.add_all(engines_supply)
 
-        engines_issue = [
+        s.add_all([
             models.EngineIssue(
                 serial="111",
                 currSite="محطة تعز",
@@ -54,59 +56,40 @@ def seed() -> None:
                 requester="قسم التشغيل",
                 issueDate="2025-11-01",
                 notes="تم صرفه للموقع",
-            )
-        ]
-
-        engines_rehab = [
+            ),
             models.EngineRehab(
                 serial="333",
                 rehabber="فريق التأهيل",
                 rehabType="إصلاح كامل",
                 rehabDate="2025-11-02",
                 notes="تم تغيير حلقات ومضخة",
-            )
-        ]
-
-        engines_check = [
-           EngineCheck(
-    serial="222",
-    inspector="فريق الفحص",
-    description="فحص حرارة وضغط زيت",  # ← بدلاً من desc="..."
-    checkDate="2025-11-03",
-    notes="الفحص ممتاز"
-)
-
-        ]
-
-        engines_upload = [
+            ),
+            models.EngineCheck(
+                serial="222",
+                inspector="فريق الفحص",
+                description="فحص حرارة وضغط زيت",
+                checkDate="2025-11-03",
+                notes="الفحص ممتاز",
+            ),
             models.EngineUpload(
                 serial="111",
                 rehabUp="نعم",
                 checkUp="لا",
                 rehabUpDate="2025-11-04",
                 notes="تم رفع المؤهل فقط",
-            )
-        ]
-
-        engines_lathe = [
+            ),
             models.EngineLathe(
                 serial="333",
                 lathe="تشغيل عمود + جلنبر",
                 latheDate="2025-11-05",
                 notes="مخرطة خارجية",
-            )
-        ]
-
-        engines_pump = [
+            ),
             models.EnginePump(
                 serial="111",
                 pumpSerial="P-111-A",
                 pumpRehab="تنظيف ورش",
                 notes="بمب جاهز",
-            )
-        ]
-
-        engines_electrical = [
+            ),
             models.EngineElectrical(
                 serial="222",
                 etype="كهرباء كاملة",
@@ -114,10 +97,10 @@ def seed() -> None:
                 alternator="نعم",
                 edate="2025-11-06",
                 notes="تم فحص الدينمو",
-            )
-        ]
+            ),
+        ])
 
-        # ------------------- المولدات -------------------
+        # ================== مولدات ==================
         gens_supply = [
             models.GeneratorSupply(
                 code="GEN001",
@@ -150,8 +133,9 @@ def seed() -> None:
                 notes="مولد مؤهل",
             ),
         ]
+        s.add_all(gens_supply)
 
-        gens_issue = [
+        s.add_all([
             models.GeneratorIssue(
                 code="GEN001",
                 issueDate="2025-11-01",
@@ -159,10 +143,7 @@ def seed() -> None:
                 requester="قسم الطاقة",
                 currSite="ذمار",
                 notes="سليم",
-            )
-        ]
-
-        gens_inspect = [
+            ),
             models.GeneratorInspect(
                 code="GEN002",
                 inspector="فريق الفحص",
@@ -171,26 +152,9 @@ def seed() -> None:
                 rehabUp="نعم",
                 checkUp="نعم",
                 notes="تم الرفع للنظام",
-            )
-        ]
-
-        s.add_all(engines_supply)
-        s.add_all(engines_issue)
-        s.add_all(engines_rehab)
-        s.add_all(engines_check)
-        s.add_all(engines_upload)
-        s.add_all(engines_lathe)
-        s.add_all(engines_pump)
-        s.add_all(engines_electrical)
-
-        s.add_all(gens_supply)
-        s.add_all(gens_issue)
-        s.add_all(gens_inspect)
+            ),
+        ])
 
         s.commit()
-        print("✅ تم إدخال بيانات تجريبية بنجاح.")
 
-
-if __name__ == "__main__":
-    # تشغيل يدوي: python -m app.seed_demo_data
-    seed()
+    return {"ok": True, "seeded": True}

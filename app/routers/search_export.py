@@ -1,93 +1,124 @@
-from fastapi import APIRouter, Depends
+from typing import Dict, List, Any
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
-from app.database import get_session
-from app.models import (
-    EngineSupply, EngineIssue, EngineRehab, EngineCheck, EngineUpload,
-    EngineLathe, EnginePump, EngineElectrical,
-    GenSupply, GenIssue, GenInspect
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+import io
+
+from ..database import get_session
+from ..models import (
+    EngineSupply, EngineIssue, EngineRehab, EngineCheck, EngineUpload, EngineLathe, EnginePump, EngineElectrical,
+    GenSupply, GenIssue, GenInspect, SparePart
 )
 
-router = APIRouter(prefix="/api/search", tags=["Search & Reports"])
+
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+from openpyxl import Workbook
+from ..utils import write_rows
+from datetime import datetime
+
+router = APIRouter(prefix="/search", tags=["Search & Export"])
+
+def latest_one(session: Session, model, where):
+    return session.exec(select(model).where(where).order_by(desc(model.created_at)).limit(1)).first()
 
 @router.get("/summary")
-def search_summary(q: str, session: Session = Depends(get_session)):
-    q = q.strip()
+def summary(q: str = Query(...), session: Session = Depends(get_session)) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
 
-    engines = session.exec(select(EngineSupply).where(EngineSupply.serial.contains(q))).all()
-    gens = session.exec(select(GenSupply).where(GenSupply.code.contains(q))).all()
-
-    rows = []
-
-    # 🛠️ المحركات
-    for e in engines:
-        issue = session.exec(select(EngineIssue).where(EngineIssue.serial == e.serial)).first()
-        rehab = session.exec(select(EngineRehab).where(EngineRehab.serial == e.serial)).first()
-        check = session.exec(select(EngineCheck).where(EngineCheck.serial == e.serial)).first()
-        upload = session.exec(select(EngineUpload).where(EngineUpload.serial == e.serial)).first()
-        lathe = session.exec(select(EngineLathe).where(EngineLathe.serial == e.serial)).first()
-        pump = session.exec(select(EnginePump).where(EnginePump.serial == e.serial)).first()
-        elect = session.exec(select(EngineElectrical).where(EngineElectrical.serial == e.serial)).first()
+    # ========= محركات =========
+    eng_sup = session.exec(select(EngineSupply).where(EngineSupply.serial == q)).all()
+    for s in eng_sup:
+        issue = latest_one(session, EngineIssue, EngineIssue.serial == s.serial)
+        rehab = latest_one(session, EngineRehab, EngineRehab.serial == s.serial)
+        check = latest_one(session, EngineCheck, EngineCheck.serial == s.serial)
+        up    = latest_one(session, EngineUpload, EngineUpload.serial == s.serial)
+        spare = latest_one(session, Spare, Spare.serial == s.serial)
 
         rows.append({
             "kind": "محرك",
-            "key": e.serial,
-            "supply_type": e.engine_type,
-            "supply_model": e.model,
-            "supply_supplier": e.supplier,
-            "supply_prev_site": e.prev_site,
-            "supply_date": str(e.date.date()),
-
+            "key": s.serial,
+            "supply_type": s.type,
+            "supply_model": s.model,
+            "supply_prev_site": s.prev_site or "",
+            "supply_supplier": s.supplier or "",
+            "supply_date": str(s.date or ""),
             "issue_current_site": issue.current_site if issue else "",
-            "issue_receiver": issue.receiver if issue else "",
-            "issue_requester": issue.requester if issue else "",
-            "issue_date": str(issue.date.date()) if issue else "",
-
+            "issue_date": str(issue.date) if issue and issue.date else "",
             "rehab_by": rehab.rehab_by if rehab else "",
             "rehab_type": rehab.rehab_type if rehab else "",
-            "rehab_date": str(rehab.date.date()) if rehab else "",
-
+            "rehab_date": str(rehab.date) if rehab and rehab.date else "",
             "check_inspector": check.inspector if check else "",
-            "check_desc": check.description if check else "",
-            "check_date": str(check.date.date()) if check else "",
-
-            "upload_rehab_file": upload.rehab_file if upload else "",
-            "upload_check_file": upload.check_file if upload else "",
-            "upload_rehab_date": str(upload.rehab_date.date()) if upload and upload.rehab_date else "",
-            "upload_check_date": str(upload.check_date.date()) if upload and upload.check_date else "",
-
-            "lathe_rehab": lathe.lathe_rehab if lathe else "",
-            "lathe_supply_date": str(lathe.lathe_supply_date.date()) if lathe and lathe.lathe_supply_date else "",
-
-            "pump_serial": pump.pump_serial if pump else "",
-            "pump_rehab": pump.pump_rehab if pump else "",
-
-            "elect_kind": elect.kind if elect else "",
-            "elect_starter": "نعم" if elect and elect.has_starter else "لا",
-            "elect_dynamo": "نعم" if elect and elect.has_dynamo else "لا",
+            "check_date": str(check.date) if check and check.date else "",
+            "upload_rehab_file": up.rehab_file if up else "",
+            "upload_check_file": up.check_file if up else "",
+            "spare_last": f"{spare.item} ×{spare.qty}" if spare else "",
         })
 
-    # ⚡ المولدات
-    for g in gens:
-        issue = session.exec(select(GenIssue).where(GenIssue.code == g.code)).first()
-        inspect = session.exec(select(GenInspect).where(GenInspect.code == g.code)).first()
+    # ========= مولدات =========
+    gen_sup = session.exec(select(GenSupply).where(GenSupply.code == q)).all()
+    for s in gen_sup:
+        issue = latest_one(session, GenIssue, GenIssue.code == s.code)
+        insp  = latest_one(session, GenInspect, GenInspect.code == s.code)
+        spare = latest_one(session, Spare, Spare.serial == s.code)
 
         rows.append({
             "kind": "مولد",
-            "key": g.code,
-            "supply_type": g.gen_type,
-            "supply_model": g.model,
-            "supply_supplier": g.supplier_name,
-            "supply_prev_site": g.prev_site,
-            "supply_date": str(g.date.date()),
-
+            "key": s.code,
+            "supply_type": s.type,
+            "supply_model": s.model,
+            "supply_prev_site": s.prev_site or "",
+            "supply_supplier": s.supplier or "",
+            "supply_entity": s.entity or "",
+            "supply_date": str(s.date or ""),
             "issue_current_site": issue.current_site if issue else "",
-            "issue_receiver": issue.receiver if issue else "",
-            "issue_requester": issue.requester if issue else "",
-            "issue_date": str(issue.issue_date.date()) if issue else "",
-
-            "check_inspector": inspect.inspector if inspect else "",
-            "rehab_by": inspect.electrical_rehab_by if inspect else "",
-            "rehab_date": str(inspect.rehab_date.date()) if inspect and inspect.rehab_date else "",
+            "issue_date": str(issue.date) if issue and issue.date else "",
+            "rehab_by": insp.rehab if insp else "",
+            "rehab_type": "",
+            "rehab_date": str(insp.date) if insp and insp.date else "",
+            "check_inspector": insp.inspector if insp else "",
+            "check_date": str(insp.date) if insp and insp.date else "",
+            "upload_rehab_file": insp.rehab_file if insp else "",
+            "upload_check_file": insp.check_file if insp else "",
+            "spare_last": f"{spare.item} ×{spare.qty}" if spare else "",
         })
 
     return {"rows": rows}
+
+@router.get("/export")
+def export_search(q: str = Query(...), session: Session = Depends(get_session)):
+    data = summary(q, session)
+    rows = data.get("rows", [])
+    headers = [
+        "النوع","الرقم","نوع/مودل","الموقع السابق","الموقع الحالي","المؤهل","الفاحص",
+        "رفع مؤهل/فحص","آخر قطع","تاريخ التوريد","تاريخ الصرف","تاريخ التأهيل","تاريخ الفحص"
+    ]
+    xrows: List[List[str]] = []
+    for r in rows:
+        xrows.append([
+            r.get("kind",""),
+            r.get("key",""),
+            f"{r.get('supply_type','')}/{r.get('supply_model','')}".strip("/"),
+            r.get("supply_prev_site",""),
+            r.get("issue_current_site",""),
+            r.get("rehab_by","") or r.get("rehab_type",""),
+            r.get("check_inspector",""),
+            f"{r.get('upload_rehab_file','')}/{r.get('upload_check_file','')}".strip("/"),
+            r.get("spare_last",""),
+            r.get("supply_date",""),
+            r.get("issue_date",""),
+            r.get("rehab_date",""),
+            r.get("check_date",""),
+        ])
+
+    wb = Workbook(); ws = wb.active; ws.title = "نتيجة البحث"
+    write_rows(ws, headers, xrows)
+    bio = BytesIO(); wb.save(bio); bio.seek(0)
+    fname = f"Search_{q}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename=\"{fname}\"'}
+    )
